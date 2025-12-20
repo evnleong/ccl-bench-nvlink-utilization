@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# Orchestrated profiling of vLLM server with nsys + NVLink utilization
+# Orchestrated profiling of SGLang server with nsys + NVLink utilization
 #
 # Workflow:
-# 1. Launch vLLM server (no nsys yet, let it warm up)
+# 1. Launch SGLang server under nsys
 # 2. Wait for server to initialize
 # 3. Start nsys profiling + NVLink polling simultaneously
 # 4. Run client workload
@@ -15,8 +15,8 @@
 
 set -e
 
-# Use specific nsys version
-export PATH=~/CS5470/assignment_1/nsys_new/opt/nvidia/nsight-systems-cli/2025.5.1/bin:$PATH
+# Use nsys 2025.5.1 from user's installation
+export PATH=/pscratch/sd/e/emk255/nsight-systems-cli/opt/nvidia/nsight-systems-cli/2025.5.1/bin:$PATH
 echo "Using nsys: $(which nsys)"
 echo "  Version: $(nsys --version 2>&1 | head -1)"
 
@@ -24,14 +24,14 @@ echo "  Version: $(nsys --version 2>&1 | head -1)"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRATCH/nsys_profile}"
 NVLINK_INTERVAL_MS="${NVLINK_INTERVAL_MS:-1.0}"
 MODEL="${MODEL:-Qwen/Qwen3-32B}"
-TP_SIZE="${TP_SIZE:-4}"
-SERVER_PORT="${SERVER_PORT:-8000}"
-NSYS_OUTPUT="${OUTPUT_DIR}/vllm_profile"
+TP_SIZE="${TP_SIZE:-2}"
+SERVER_PORT="${SERVER_PORT:-30000}"
+NSYS_OUTPUT="${OUTPUT_DIR}/sglang_profile"
 PROFILE_DURATION="${PROFILE_DURATION:-60}"  # Max profiling duration in seconds
 
-# Batch size experiment parameters
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
-MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-$((MAX_NUM_SEQS * 4096))}"
+# Batch size experiment parameters (SGLang equivalents)
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"           # maps to --max-running-requests
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-$((MAX_NUM_SEQS * 4096))}"  # maps to --max-total-tokens
 NUM_PROMPTS="${NUM_PROMPTS:-$((MAX_NUM_SEQS * 5))}"
 REQUEST_RATE="${REQUEST_RATE:-inf}"
 
@@ -39,18 +39,76 @@ REQUEST_RATE="${REQUEST_RATE:-inf}"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p logs
 
-echo "=== vLLM + NVLink Profiling Session ==="
+echo "=== SGLang + NVLink Profiling Session ==="
 echo "Output directory: $OUTPUT_DIR"
 echo "Model: $MODEL"
 echo "Tensor Parallel Size: $TP_SIZE"
-echo "Batch Size (max-num-seqs): $MAX_NUM_SEQS"
-echo "Max Batched Tokens: $MAX_BATCHED_TOKENS"
+echo "Batch Size (max-running-requests): $MAX_NUM_SEQS"
+echo "Max Total Tokens: $MAX_BATCHED_TOKENS"
 echo "Num Prompts: $NUM_PROMPTS"
 echo "Request Rate: $REQUEST_RATE"
+echo "Server Port: $SERVER_PORT"
 echo ""
 
 # Environment setup
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+############################
+# Scratch base
+############################
+export SCRATCH_BASE="$PSCRATCH"
+
+############################
+# Move HOME off /global/homes
+############################
+export HOME="$SCRATCH_BASE/fake_home"
+mkdir -p "$HOME"
+
+############################
+# Hugging Face cache
+############################
+export HF_HOME="$SCRATCH_BASE/huggingface"
+mkdir -p "$HF_HOME"
+
+############################
+# XDG cache (many libs respect this)
+############################
+export XDG_CACHE_HOME="$SCRATCH_BASE/.cache"
+mkdir -p "$XDG_CACHE_HOME"
+
+############################
+# Triton cache (JIT kernels)
+############################
+export TRITON_CACHE_DIR="$SCRATCH_BASE/triton-cache"
+mkdir -p "$TRITON_CACHE_DIR"
+
+############################
+# FlashInfer cache (JIT kernels)
+############################
+export FLASHINFER_CACHE_DIR="$SCRATCH_BASE/flashinfer-cache"
+mkdir -p "$FLASHINFER_CACHE_DIR"
+
+############################
+# Compiler sanity for nvcc (fixes GCC version error)
+############################
+unset CC
+unset CXX
+export CUDAHOSTCXX=/usr/bin/gcc
+
+############################
+# Optional: keep temp files off home
+############################
+export TMPDIR="$SCRATCH_BASE/tmp"
+mkdir -p "$TMPDIR"
+
+echo "Environment initialized:"
+echo "  HOME=$HOME"
+echo "  HF_HOME=$HF_HOME"
+echo "  XDG_CACHE_HOME=$XDG_CACHE_HOME"
+echo "  TRITON_CACHE_DIR=$TRITON_CACHE_DIR"
+echo "  FLASHINFER_CACHE_DIR=$FLASHINFER_CACHE_DIR"
+echo "  CUDAHOSTCXX=$CUDAHOSTCXX"
+echo ""
 
 # Cleanup function
 cleanup() {
@@ -76,7 +134,7 @@ trap cleanup EXIT INT TERM
 # ============================================================
 # PHASE 1: Start server under nsys (captures everything including model load)
 # ============================================================
-echo "[$(date)] === Phase 1: Starting vLLM Server under nsys ==="
+echo "[$(date)] === Phase 1: Starting SGLang Server under nsys ==="
 
 # Record nsys start time - used for timestamp correlation
 NSYS_START_WALL_NS=$(python3 -c "import time; print(time.time_ns())")
@@ -97,6 +155,7 @@ EOF
 
 echo "[$(date)] nsys start time: $NSYS_START_ISO"
 
+# SGLang server command
 nsys profile \
     --output="$NSYS_OUTPUT" \
     --force-overwrite=true \
@@ -104,18 +163,15 @@ nsys profile \
     --cuda-memory-usage=true \
     --sample=none \
     --cpuctxsw=none \
-    -- python3 -m vllm.entrypoints.openai.api_server \
-        --tensor-parallel-size "$TP_SIZE" \
-        --max-model-len 4096 \
-        --model "$MODEL" \
-        --swap-space 16 \
-        --disable-log-requests \
-        --enforce-eager \
-        --enable-chunked-prefill \
-    --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
-    --max-num-seqs "$MAX_NUM_SEQS" \
+    -- python3 -m sglang.launch_server \
+        --model-path "$MODEL" \
+        --tp-size "$TP_SIZE" \
+        --context-length 4096 \
+        --trust-remote-code \
+        --max-running-requests "$MAX_NUM_SEQS" \
         --port "$SERVER_PORT" \
-        --disable-sliding-window \
+        --disable-cuda-graph \
+        --log-level warning \
     > logs/server_nsys.log 2>&1 &
 
 NSYS_PID=$!
@@ -130,10 +186,13 @@ while ! curl -s "http://localhost:$SERVER_PORT/health" > /dev/null 2>&1; do
     WAITED=$((WAITED + 5))
     if [ $WAITED -ge $MAX_WAIT ]; then
         echo "[ERROR] Server did not start within $MAX_WAIT seconds"
+        echo "Last 50 lines of server log:"
+        cat logs/server_nsys.log | tail -50
         exit 1
     fi
     if ! kill -0 $NSYS_PID 2>/dev/null; then
         echo "[ERROR] nsys/server process died"
+        echo "Last 50 lines of server log:"
         cat logs/server_nsys.log | tail -50
         exit 1
     fi
@@ -189,30 +248,17 @@ echo ""
 # ============================================================
 echo "[$(date)] === Phase 3: Running Client Workload ==="
 
-# Build benchmark command based on configuration
-BENCHMARK_CMD="python3 benchmark.py --backend vllm \
-    --model $MODEL \
-    --num-prompts $NUM_PROMPTS \
-    --dataset-name ${DATASET_NAME:-dummy} \
+# SGLang is OpenAI API compatible, we use --backend sglang
+python3 benchmark.py --backend sglang \
+    --model "$MODEL" \
+    --port "$SERVER_PORT" \
+    --request-rate "$REQUEST_RATE" \
+    --num-prompts "$NUM_PROMPTS" \
+    --dataset-name dummy \
     --long-prompts 0 \
     --long-prompt-len 32000 \
     --save-result \
-    --result-dir "$OUTPUT_DIR""
-
-# Add dataset path if using burstgpt
-if [ "${DATASET_NAME:-dummy}" = "burstgpt" ]; then
-    BENCHMARK_CMD="$BENCHMARK_CMD --dataset-path ${DATASET_PATH:-BurstGPT_without_fails_1.csv}"
-fi
-
-# Add timestamp-based bursty load if enabled
-if [ "${USE_TIMESTAMPS:-false}" = "true" ]; then
-    BENCHMARK_CMD="$BENCHMARK_CMD --use-timestamps --time-scale ${TIME_SCALE:-1.0}"
-else
-    BENCHMARK_CMD="$BENCHMARK_CMD --request-rate $REQUEST_RATE"
-fi
-
-echo "Running: $BENCHMARK_CMD"
-eval $BENCHMARK_CMD
+    --result-dir "$OUTPUT_DIR"
 
 echo ""
 
@@ -271,19 +317,20 @@ if [ -f "${NSYS_OUTPUT}.nsys-rep" ]; then
     echo "[$(date)] Exporting to SQLite (this may take a while for large traces)..."
     nsys export \
         --type sqlite \
+        --force-overwrite true \
         --output "${NSYS_OUTPUT}.sqlite" \
         "${NSYS_OUTPUT}.nsys-rep"
     echo "[$(date)] SQLite export complete!"
 else
     echo "[WARNING] nsys report not found: ${NSYS_OUTPUT}.nsys-rep"
-    echo "  Check logs/nsys.log for errors"
+    echo "  Check logs/server_nsys.log for errors"
 fi
 
 # ============================================================
 # Summary
 # ============================================================
 echo ""
-echo "=== Profiling Complete ==="
+echo "=== Profiling Complete (SGLang) ==="
 echo "Output directory: $OUTPUT_DIR"
 echo ""
 echo "Files created:"
@@ -295,4 +342,3 @@ echo "Profiling duration: ${DURATION_S} seconds"
 echo ""
 echo "Next steps:"
 echo "  python3 correlate_nsys_nvlink.py $OUTPUT_DIR"
-
